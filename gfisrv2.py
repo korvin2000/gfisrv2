@@ -662,7 +662,7 @@ class GatedCNNBlock(nn.Module):
         return x * self.gamma + shortcut
 
 
-class FSR(nn.Module):
+class GFISRV2(nn.Module):
     def __init__(
         self,
         in_nc=3,
@@ -721,54 +721,4 @@ class FSR(nn.Module):
         return self.upscale(x)[:, :, : H * self.scale, : W * self.scale]
 
 
-def benchmark_model(model, height, width, iterations_warmup=6, iterations_test=100):
-    model = model.cuda().eval()
-    params = sum(p.numel() for p in model.parameters())
-    results = {"runtime": []}
 
-    x = torch.randn((1, 3, height, width)).to(device="cuda")
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    with torch.autocast("cuda", torch.half):
-        with torch.inference_mode():
-            # Warm-up iterations
-            for _ in range(iterations_warmup):
-                sr = model(x)
-            # Benchmark iterations
-            for _ in range(iterations_test):
-                start.record()
-                _ = model(x)
-                end.record()
-                torch.cuda.synchronize()
-                results["runtime"].append(start.elapsed_time(end))  # milliseconds
-
-    avg_runtime = sum(results["runtime"]) / len(results["runtime"])
-    fps = 1000 / avg_runtime
-    memory_usage = (
-        torch.cuda.max_memory_allocated(torch.cuda.current_device()) / 1024**2
-    )
-
-    print(f"- In Shape: {list(x.shape)}")
-    print(f"- Out Shape: {list(sr.shape)}")
-    print(f"- FPS: {fps:.2f}fps")
-    print(f"- Max Memory: {memory_usage:.2f}[M]")
-    print(f"- Parameters: {params / 1e3:.2f}K")
-    return results
-
-
-if __name__ == "__main__":
-    # Модели для тестирования
-    models = [
-        ("MoSR1", FSR().to(device="cuda", memory_format=torch.channels_last)),
-        # ("MoSR", MoSR()),
-        # ("Span", SPAN(3, 3,upscale=2).to(memory_format=torch.channels_last)),
-    ]
-
-    height, width = 1024, 1024
-    # upscale = 4
-    #
-    for name, model in models:
-        print(f"\nBenchmarking {name}...")
-        benchmark_model(model, height, width)
