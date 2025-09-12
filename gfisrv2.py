@@ -554,9 +554,7 @@ class FourierUnit(nn.Module):
         ffted = self.fdc(ffted)
         ffted = self.gelu(ffted)
         ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous().float()
-
         out = CustomIRFFT2.apply(ffted)
-        # опционально:
         out = self.post_norm(out.to(orig_dtype))
         return out
 
