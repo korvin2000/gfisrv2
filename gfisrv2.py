@@ -517,7 +517,24 @@ class CustomIRFFT2(torch.autograd.Function):
         y = g.op("Slice", y, s0, s1, axC)
         y = g.op("Squeeze", y, axC)
         return y
-
+class CustomRfft2Wrap(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        if self.training:
+            y = torch.fft.rfft2(x, dim=(2, 3), norm="ortho")
+            return torch.view_as_real(y)
+        else:
+            return CustomRFFT2().apply(x)
+class CustomIrfft2Wrap(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        if self.training:
+            x_c = torch.view_as_complex(x)  # [B,C,H,Wr]
+            return torch.fft.irfft2(x_c, dim=(2, 3), norm="ortho")  # [B,C,H,W]
+        else:
+            return CustomIRFFT2().apply(x)
 
 class FourierUnit(nn.Module):
     def __init__(self, in_channels, out_channels) -> None:
@@ -541,12 +558,14 @@ class FourierUnit(nn.Module):
             bias=True,
         )
         self.gelu = nn.GELU()
+        self.irfft2 = CustomIrfft2Wrap()
+        self.rfft2 = CustomRfft2Wrap()
 
     def forward(self, x):
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         b, c, h, w = x.shape
-        ffted = CustomRFFT2.apply(x)
+        ffted = self.rfft2(x)
         ffted = ffted.permute(0, 4, 1, 2, 3).contiguous()
         ffted = ffted.view(b, c * 2, h, -1).to(orig_dtype)
         ffted = self.rn(ffted)
@@ -554,7 +573,7 @@ class FourierUnit(nn.Module):
         ffted = self.fdc(ffted)
         ffted = self.gelu(ffted)
         ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous().float()
-        out = CustomIRFFT2.apply(ffted)
+        out = self.irfft2(ffted)
         out = self.post_norm(out.to(orig_dtype))
         return out
 
