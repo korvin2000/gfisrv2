@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -55,6 +55,8 @@ class DySample(nn.Module):
             nn.init.constant_(self.scope.weight, val=0)
 
         self.register_buffer("init_pos", self._init_pos())
+        self._coords_cache: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._normalizer_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
     def _init_pos(self) -> Tensor:
         h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
@@ -65,24 +67,37 @@ class DySample(nn.Module):
             .reshape(1, -1, 1, 1)
         )
 
+    def _get_coords(self, height: int, width: int, dtype: torch.dtype, device: torch.device) -> Tensor:
+        key = (height, width)
+        if key not in self._coords_cache:
+            coords_w = torch.arange(width, dtype=torch.float32) + 0.5
+            coords_h = torch.arange(height, dtype=torch.float32) + 0.5
+            base = (
+                torch.stack(torch.meshgrid(coords_w, coords_h, indexing="ij"))
+                .transpose(1, 2)
+                .unsqueeze(1)
+                .unsqueeze(0)
+            )
+            self._coords_cache[key] = base
+        return self._coords_cache[key].to(device=device, dtype=dtype, non_blocking=True)
+
+    def _get_normalizer(
+        self, height: int, width: int, dtype: torch.dtype, device: torch.device
+    ) -> Tensor:
+        key = (height, width)
+        if key not in self._normalizer_cache:
+            normalizer = torch.tensor([width, height], dtype=torch.float32).view(
+                1, 2, 1, 1, 1
+            )
+            self._normalizer_cache[key] = normalizer
+        return self._normalizer_cache[key].to(device=device, dtype=dtype, non_blocking=True)
+
     def forward(self, x: Tensor) -> Tensor:
         offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
         B, _, H, W = offset.shape
         offset = offset.view(B, 2, -1, H, W)
-        coords_h = torch.arange(H) + 0.5
-        coords_w = torch.arange(W) + 0.5
-
-        coords = (
-            torch.stack(torch.meshgrid([coords_w, coords_h], indexing="ij"))
-            .transpose(1, 2)
-            .unsqueeze(1)
-            .unsqueeze(0)
-            .type(x.dtype)
-            .to(x.device, non_blocking=True)
-        )
-        normalizer = torch.tensor(
-            [W, H], dtype=x.dtype, device=x.device, pin_memory=True
-        ).view(1, 2, 1, 1, 1)
+        coords = self._get_coords(H, W, x.dtype, x.device)
+        normalizer = self._get_normalizer(H, W, x.dtype, x.device)
         coords = 2 * (coords + offset) / normalizer - 1
 
         coords = (
@@ -173,7 +188,6 @@ class LDA_AQU(nn.Module):
             nn.SiLU(),
             nn.Conv2d(self.group_channel, 2 * k_u**2, k_e, 1, k_e // 2),
         )
-        print(2 * k_u**2)
         self.layer_norm = LayerNorm(in_channels)
 
         self.pad = int((self.k_u - 1) / 2)
@@ -578,6 +592,43 @@ class FourierUnit(nn.Module):
         return out
 
 
+class LargeKernelAttention(nn.Module):
+    """Large kernel attention module for capturing rich textures."""
+
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 7,
+        dilation: int = 3,
+    ) -> None:
+        super().__init__()
+        effective_padding = (kernel_size // 2) * dilation
+        self.dwconv = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=kernel_size,
+            padding=effective_padding,
+            groups=dim,
+            dilation=dilation,
+        )
+        self.dwconv_local = nn.Conv2d(
+            dim,
+            dim,
+            kernel_size=5,
+            padding=2,
+            groups=dim,
+        )
+        self.pointwise = nn.Conv2d(dim, dim, 1)
+        self.act = nn.SiLU()
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x: Tensor) -> Tensor:
+        attn = self.dwconv(x)
+        attn = self.dwconv_local(attn)
+        attn = self.pointwise(self.act(attn))
+        return x * self.gate(attn)
+
+
 class InceptionDWConv2d(nn.Module):
     """Inception depthwise convolution"""
 
@@ -653,6 +704,9 @@ class GatedCNNBlock(nn.Module):
         hidden = int(expansion_ratio * dim)
         self.gamma = nn.Parameter(torch.ones([1, dim, 1, 1]), requires_grad=True)
         self.norm = RMSNorm(dim)
+        self.context_norm = RMSNorm(dim)
+        self.attention = LargeKernelAttention(dim)
+        self.beta = nn.Parameter(torch.zeros([1, dim, 1, 1]))
         self.fc1 = nn.Conv2d(dim, hidden * 2, 3, 1, 1)
         self.act = nn.SiLU()
         conv_channels = dim
@@ -669,31 +723,34 @@ class GatedCNNBlock(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        shortcut = x
+        x = x + self.beta * self.attention(self.context_norm(x))
+        residual = x
         x = self.norm(x)
         x = self.fc1(x)
         g, i, c = torch.split(x, self.split_indices, dim=1)
         c = self.conv(c)
         x = self.act(self.fc2(self.act(g) * torch.cat((i, c), dim=1)))
 
-        return x * self.gamma + shortcut
+        return x * self.gamma + residual
 
 
 class GFISRV2(nn.Module):
     def __init__(
         self,
         in_nc=3,
-        dim=48,
+        dim=64,
         expansion_ratio=8 / 3,
         scale=4,
         out_nc=3,
         upsampler: SampleMods = "pixelshuffledirect",
-        mid_dim=32,
+        mid_dim: Optional[int] = None,
         pixel_unshuffle=False,
         n_blocks=24,
         **kwargs,
     ) -> None:
         super().__init__()
+        if mid_dim is None:
+            mid_dim = dim
         if pixel_unshuffle and scale in [1, 2]:
             down = 4 // scale
             self.in_to_dim = nn.Sequential(
@@ -704,17 +761,24 @@ class GFISRV2(nn.Module):
         else:
             self.in_to_dim = nn.Conv2d(in_nc, dim, 3, 1, 1)
             self.pad = 2
-        self.gfisr_body = nn.Sequential(
-            *[
+        self.body_blocks = nn.ModuleList(
+            [
                 GatedCNNBlock(dim, expansion_ratio=expansion_ratio, shift=i)
                 for i in range(n_blocks)
             ]
-            + [
-                nn.Conv2d(dim, dim * 2, 3, 1, 1),
-                nn.SiLU(True),
-                nn.Conv2d(dim * 2, dim, 3, 1, 1),
-            ]
         )
+        self.trunk_tail = nn.Sequential(
+            nn.Conv2d(dim, dim * 2, 3, 1, 1),
+            nn.SiLU(True),
+            nn.Conv2d(dim * 2, dim, 3, 1, 1),
+        )
+        self.feature_fusion = nn.Sequential(
+            RMSNorm(dim * 2),
+            nn.Conv2d(dim * 2, dim, 1),
+            nn.SiLU(True),
+            nn.Conv2d(dim, dim, 3, 1, 1),
+        )
+        self.fusion_scale = nn.Parameter(torch.zeros([1, dim, 1, 1]))
 
         self.upscale = UniUpsampleV3(
             upsampler, scale, dim, out_nc, mid_dim, dysample_end_kernel=3
@@ -732,10 +796,22 @@ class GFISRV2(nn.Module):
         mod_pad_w = (self.pad - W % self.pad) % self.pad
 
         x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), "reflect")
-        x = self.in_to_dim(x)
-
-        x = self.gfisr_body(x) + x
-        return self.upscale(x)[:, :, : H * self.scale, : W * self.scale]
+        features = self.in_to_dim(x)
+        residual = features
+        early_feature = None
+        total_blocks = len(self.body_blocks)
+        gather_index = max(total_blocks // 3, 0)
+        for idx, block in enumerate(self.body_blocks):
+            features = block(features)
+            if early_feature is None and idx >= gather_index:
+                early_feature = features
+        if early_feature is None:
+            early_feature = features
+        trunk = self.trunk_tail(features)
+        fusion = self.feature_fusion(torch.cat((early_feature, features), dim=1))
+        body = trunk + residual + self.fusion_scale * fusion
+        output = self.upscale(body)
+        return output[:, :, : H * self.scale, : W * self.scale]
 
 
 
